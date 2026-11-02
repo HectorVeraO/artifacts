@@ -652,7 +652,7 @@
   <div class="wrap">
     <div class="hero__eyebrow">Technical note · DeepSeek API</div>
     <h1 class="hero__title">How DeepSeek's context cache works</h1>
-    <p class="hero__lead">Prefix caching on disk, on by default: no code, no <code>cache_control</code>, no TTL. A cache-hit input token costs 50 times less than a miss, and in the session measured below 99.50% of input tokens hit.</p>
+    <p class="hero__lead">DeepSeek keeps a prefix cache on disk and turns it on for every request, with nothing to configure and no <code>cache_control</code> field to send. A cache-hit input token costs 50 times less than a miss; in the session measured below, 99.50% of input tokens hit.</p>
   </div>
 </section>
 
@@ -664,7 +664,7 @@
       <h2>The matching rule</h2>
     </div>
     <p class="lead-claim">A request hits only when everything it sends begins with a prefix that already exists on disk as a persisted cache unit.</p>
-    <p class="prose">Matching is on the token prefix, not on the conversation and not on a request identifier. A cache unit is written in three situations:</p>
+    <p class="prose">Matching is on the token prefix, not on the conversation or a request identifier. A cache unit is written in three situations:</p>
 
     <ol class="rule-list">
       <li>
@@ -702,7 +702,7 @@
       </dl>
     </div>
 
-    <p class="prose" style="margin-top: var(--s-4);">The miss does not throw work away: A+C is persisted at its own end, so a later A+C+E hits A+C. What never happens is a partial match inside a request. Either the prefix matches to the end of a persisted unit, or those tokens are new.</p>
+    <p class="prose" style="margin-top: var(--s-4);">A miss still deposits something: A+C is persisted at its own end, so a later A+C+E hits A+C. A request never gets a partial match. Either its prefix matches a persisted unit to the end, or those tokens are billed as new.</p>
   </section>
 
   <section class="section" id="growth">
@@ -781,7 +781,7 @@
           </g>
         </svg>
       </div>
-      <figcaption>Bar heights are schematic: the point is the composition, not the exact counts. The cached prefix carries over untouched from one turn to the next and only the tail is billed as new input. The last bar re-sends the same 30k-token context after an invalidation, when nothing matches and every token is billed at the miss rate, $0.009 at peak.</figcaption>
+      <figcaption>Bar heights are schematic, drawn to show composition. The cached prefix carries over untouched from one turn to the next and only the tail is billed as new input. The last bar re-sends the same 30k-token context after an invalidation, when nothing matches and every token is billed at the miss rate, $0.009 at peak.</figcaption>
     </figure>
   </section>
 
@@ -791,7 +791,7 @@
       <h2>Measured on a real session</h2>
     </div>
     <p class="lead-claim">One root OpenCode session on deepseek-flash spent $0.2398 to move 36.0M tokens, and 99.50% of the input tokens were cache hits.</p>
-    <p class="prose">Figures come from the session's own usage record and from the provider-reported cost. Prices are the off-peak rates: $0.003 per 1M cache-hit input, $0.15 per 1M miss input, $0.60 per 1M output, with reasoning billed as output.</p>
+    <p class="prose">Figures are the session's usage record and the provider-reported cost. Prices are the off-peak rates: $0.003 per 1M cache-hit input, $0.15 per 1M miss input, $0.60 per 1M output, with reasoning billed as output.</p>
 
     <div class="data-table-wrap">
       <table class="data-table">
@@ -854,7 +854,7 @@
       </ul>
     </div>
 
-    <p class="prose" style="margin-top: var(--s-5);">The three lines add up to the $0.2398 the provider reported, to the cent. That is how the price model was confirmed: no separate charge appears for writing the cache, reasoning bills at the output rate, and everything read back gets the same discount.</p>
+    <p class="prose" style="margin-top: var(--s-5);">The three lines add up to the $0.2398 the provider reported, to the cent, which is how the price model was confirmed: writing the cache costs nothing, reasoning bills at the output rate, and every token read back gets the same discount.</p>
     <p class="prose">The cache was already warm at the first request. Session start read 12,544 tokens from cache against 5,288 new ones, because a previous session had persisted the same system prompt. Only a first session with nothing on disk pays the miss price on its prompt.</p>
   </section>
 
@@ -864,7 +864,7 @@
       <h2>What breaks the cache</h2>
     </div>
     <p class="lead-claim">Changing anything at the front of the request invalidates every unit written after the first token that differs.</p>
-    <p class="prose">In an agent session the front of the request is assembled, not typed. That is where a cache gets lost:</p>
+    <p class="prose">In an agent session the front of the request is assembled rather than typed, which is where a cache gets lost:</p>
 
     <ul class="breaker-list">
       <li><strong>Editing an instruction file the agent loads.</strong> <span>An instruction file, a rules file or a skill body sits near the start, so every token after it counts as new.</span></li>
@@ -875,7 +875,7 @@
       <li><strong>Context compaction.</strong> <span>History is replaced by a summary, and the summary is not the text that was cached.</span></li>
     </ul>
 
-    <p class="price-note">A full invalidation on a 40k-token context costs $0.012 at peak, at $0.30 per 1M miss tokens, or $0.006 off-peak. The same 40k read from cache costs $0.00024 at peak. A handful of invalidations in a session is noise; a reload inside a loop is not.</p>
+    <p class="price-note">A full invalidation on a 40k-token context costs $0.012 at peak, at $0.30 per 1M miss tokens, or $0.006 off-peak. The same 40k read from cache costs $0.00024 at peak. A few invalidations in a session cost little; running a reload inside a loop does not.</p>
 
     <h3 class="subhead">What does not break it</h3>
     <ul class="plain-list">
@@ -888,9 +888,9 @@
   <section class="section" id="cost">
     <div class="section-head">
       <span class="section-num">05</span>
-      <h2>Where the money actually goes</h2>
+      <h2>Cost drivers and peak pricing</h2>
     </div>
-    <p class="prose">In the measured session, cached input and output cost almost the same amount, $0.1070 against $0.1060, but they behave differently. Cached input grows with how long the session runs and is paid at the cheapest rate on the price list; output grows with what the model writes and what it reasons through, and you decide both. Peak pricing beats every caching trick: two UTC windows on weekdays (01:00-04:00 and 06:00-10:00) double every line, and the same session at peak would have cost $0.4796. Running a long job off-peak is worth more than any cache optimisation inside it.</p>
+    <p class="prose">In the measured session, cached input and output cost nearly the same, $0.1070 against $0.1060, but they move for different reasons. Cached input grows with how long the session runs and is paid at the cheapest rate on the list. Output grows with what the model writes and reasons through, which you decide. Peak pricing multiplies both: two UTC windows on weekdays (01:00-04:00 and 06:00-10:00) double every line, so the same session at peak would have cost $0.4796. Scheduling a long job outside those windows saves more than any change to how the cache is used.</p>
   </section>
 
 </main>
