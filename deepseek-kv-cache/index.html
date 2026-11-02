@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How DeepSeek's context cache works</title>
+  <meta name="description" content="Prefix caching on disk for the DeepSeek API: matching rule, measured hit rates, invalidation triggers and where the cost goes.">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Mono:wght@700&display=swap">
+
+  <style>
+    /* =====================================================================
+       BASE TOKENS - shared base for brand packs (Atacama uses it).
+       ===================================================================== */
+    :root {
+      --fs-xs:     0.75rem;
+      --fs-sm:     0.875rem;
+      --fs-base:   1rem;
+      --fs-md:     1.125rem;
+      --fs-lg:     1.375rem;
+      --fs-xl:     1.75rem;
+      --fs-2xl:    2.25rem;
+      --fs-3xl:    2.875rem;
+      --fs-4xl:    3.625rem;
+
+      --lh-tight:  1.1;
+      --lh-snug:   1.25;
+      --lh-normal: 1.55;
+      --lh-relaxed:1.75;
+
+      --fw-regular: 400;
+      --fw-medium:  500;
+      --fw-semi:    600;
+      --fw-bold:    700;
+      --fw-black:   800;
+
+      --s-0:  0;
+      --s-1:  0.25rem;
+      --s-2:  0.5rem;
+      --s-3:  0.75rem;
+      --s-4:  1rem;
+      --s-5:  1.5rem;
+      --s-6:  2rem;
+      --s-7:  2.75rem;
+      --s-8:  3.5rem;
+      --s-9:  4.5rem;
+      --s-10: 6rem;
+
+      --r-xs: 4px;
+      --r-sm: 8px;
+      --r-md: 12px;
+      --r-lg: 20px;
+      --r-xl: 28px;
+      --r-pill: 9999px;
+
+      --sh-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+      --sh-sm: 0 2px 6px rgba(0, 0, 0, 0.06);
+      --sh-md: 0 6px 18px rgba(0, 0, 0, 0.08);
+      --sh-lg: 0 18px 40px rgba(0, 0, 0, 0.10);
+
+      --content-max: 1160px;
+      --gutter:      clamp(1rem, 3vw, 2rem);
+
+      --ease:  cubic-bezier(0.22, 1, 0.36, 1);
+      --dur-1: 120ms;
+      --dur-2: 240ms;
+      --dur-3: 480ms;
+
+      --ok:      #10B981;
+      --ok-soft: #ECFDF5;
+      --warn:    #F59E0B;
+      --warn-soft:#FFFBEB;
+      --err:     #E11D48;
+      --err-soft:#FEF2F2;
+      --info:    #1570EF;
+      --info-soft:#EFF8FF;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--font-body, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+      font-size: var(--fs-base);
+      line-height: var(--lh-normal);
+      color: var(--ink, #17162e);
+      background: var(--bg, #FFFFFF);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    h1, h2, h3, h4 {
+      font-family: var(--font-display, var(--font-body, system-ui));
+      font-weight: var(--fw-heading, var(--fw-semi));
+      line-height: var(--lh-tight);
+      margin: 0 0 var(--s-3);
+      color: var(--ink, #17162e);
+      text-wrap: balance;
+    }
+    h1 { font-size: clamp(var(--fs-2xl), 5vw, var(--fs-4xl)); letter-spacing: -0.02em; }
+    h2 { font-size: clamp(var(--fs-xl), 3.5vw, var(--fs-2xl)); letter-spacing: -0.01em; }
+    h3 { font-size: var(--fs-lg); }
+    h4 { font-size: var(--fs-md); }
+    p  { margin: 0 0 var(--s-4); text-wrap: pretty; }
+    a  { color: var(--brand, currentColor); text-underline-offset: 0.15em; }
+    small, .muted { color: var(--muted, #6B6B6B); text-wrap: pretty; }
+
+    .container { max-width: var(--content-max); margin-inline: auto; padding-inline: var(--gutter); }
+    .section { padding-block: var(--s-8); }
+    .grid    { display: grid; gap: var(--s-5); }
+    .flex    { display: flex; gap: var(--s-4); }
+    .stack > * + * { margin-top: var(--s-4); }
+
+    @media print {
+      body { background: #fff; }
+      .no-print { display: none !important; }
+      .section { padding-block: var(--s-5); page-break-inside: avoid; }
+      a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 0.8em; color: #666; }
+    }
+
+    /* =====================================================================
+       ATACAMA - brand tokens
+       ===================================================================== */
+    :root {
+      color-scheme: light;
+
+      --font-display: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --font-body:    'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      --font-mono:    'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --fw-heading:   700;
+      --heading-tracking: 0;
+
+      --brand:         #ae3358;
+      --brand-hover:   #8f2746;
+      --brand-soft:    #f9e8ec;
+      --brand-softer:  #fcf3f5;
+      --brand-fill:    #d9577a;
+      --brand-on-dark: #f08aa6;
+
+      --accent:        #177470;
+      --accent-soft:   #e1f1ef;
+      --accent-fill:   #278f8b;
+      --accent-on-dark:#4cc3bf;
+
+      --ink:           #17162e;
+      --ink-2:         #2c2b4a;
+      --ink-pure:      var(--ink);
+      --muted:         #5a5972;
+
+      --bg:            #f4f2ec;
+      --bg-2:          #eae7de;
+      --bg-subtle:     #efece4;
+      --card:          #fbfaf6;
+      --border:        #d8d4c8;
+      --border-strong: #bdb8a9;
+
+      --footer-bg:     #17162e;
+      --footer-text:   #f4f2ec;
+      --footer-muted:  #b3b1cc;
+      --code-bg:       #17162e;
+      --code-border:   #34325a;
+      --code-text:     #e6e3f2;
+
+      --on-brand-fill: #17162e;
+      --print-ink:     #17162e;
+
+      --ok:        #08724e;  --ok-soft:   #e0f3ea;
+      --warn:      #9a4a06;  --warn-soft: #f8e8cf;
+      --err:       #c0173f;  --err-soft:  #f8dde3;
+      --info:      #1d5fd1;  --info-soft: #dde8fa;
+
+      --chart-series-1: var(--brand-fill);
+      --chart-series-2: var(--accent-fill);
+      --chart-series-3: var(--ink);
+      --chart-series-4: #b9801c;
+      --chart-series-5: #6b5fc7;
+      --chart-series-6: var(--info);
+      --chart-grid:     rgba(23, 22, 46, 0.10);
+      --chart-axis:     var(--muted);
+
+      --sh-xs: 0 1px 2px rgba(23, 22, 46, 0.05);
+      --sh-sm: 0 1px 3px rgba(23, 22, 46, 0.08);
+      --sh-md: 0 6px 16px rgba(23, 22, 46, 0.10);
+      --sh-lg: 0 18px 40px rgba(23, 22, 46, 0.14);
+
+      --r-sm: 6px;
+      --r-md: 8px;
+      --r-lg: 12px;
+
+      --logo-horizontal-h: 30px;
+      --logo-vertical-h:   44px;
+      --logo-icon-size:    32px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --brand:         #f08aa6;
+        --brand-hover:   #f7a9be;
+        --brand-soft:    #3a2640;
+        --brand-softer:  #2a2040;
+        --brand-fill:    #ef7f9c;
+        --accent:        #4cc3bf;
+        --accent-soft:   #1c3a4a;
+        --accent-fill:   #4cc3bf;
+        --ink:           #f4f2ec;
+        --ink-2:         #dcd9e8;
+        --muted:         #a9a7c2;
+        --bg:            #17162e;
+        --bg-2:          #1f1e3b;
+        --bg-subtle:     #1b1a35;
+        --card:          #232142;
+        --border:        #34325a;
+        --border-strong: #4a4775;
+        --footer-bg:     #0f0e20;
+        --footer-muted:  #a9a7c2;
+        --code-bg:       #0f0e20;
+        --ok:   #34d399;  --ok-soft:   #12392f;
+        --warn: #fbbf24;  --warn-soft: #40330f;
+        --err:  #fb7185;  --err-soft: #45202f;
+        --info: #8db3ff;  --info-soft: #1f2e57;
+        --chart-series-4: #e0a63a;
+        --chart-series-5: #9d93f0;
+        --chart-grid:     rgba(244, 242, 236, 0.12);
+        --sh-xs: 0 1px 2px rgba(0, 0, 0, 0.30);
+        --sh-sm: 0 1px 3px rgba(0, 0, 0, 0.35);
+        --sh-md: 0 6px 16px rgba(0, 0, 0, 0.40);
+        --sh-lg: 0 18px 40px rgba(0, 0, 0, 0.50);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --brand:         #f08aa6;
+      --brand-hover:   #f7a9be;
+      --brand-soft:    #3a2640;
+      --brand-softer:  #2a2040;
+      --brand-fill:    #ef7f9c;
+      --accent:        #4cc3bf;
+      --accent-soft:   #1c3a4a;
+      --accent-fill:   #4cc3bf;
+      --ink:           #f4f2ec;
+      --ink-2:         #dcd9e8;
+      --muted:         #a9a7c2;
+      --bg:            #17162e;
+      --bg-2:          #1f1e3b;
+      --bg-subtle:     #1b1a35;
+      --card:          #232142;
+      --border:        #34325a;
+      --border-strong: #4a4775;
+      --footer-bg:     #0f0e20;
+      --footer-muted:  #a9a7c2;
+      --code-bg:       #0f0e20;
+      --ok:   #34d399;  --ok-soft:   #12392f;
+      --warn: #fbbf24;  --warn-soft: #40330f;
+      --err:  #fb7185;  --err-soft: #45202f;
+      --info: #8db3ff;  --info-soft: #1f2e57;
+      --chart-series-4: #e0a63a;
+      --chart-series-5: #9d93f0;
+      --chart-grid:     rgba(244, 242, 236, 0.12);
+      --sh-xs: 0 1px 2px rgba(0, 0, 0, 0.30);
+      --sh-sm: 0 1px 3px rgba(0, 0, 0, 0.35);
+      --sh-md: 0 6px 16px rgba(0, 0, 0, 0.40);
+      --sh-lg: 0 18px 40px rgba(0, 0, 0, 0.50);
+    }
+
+    body { background: var(--bg); color: var(--ink); }
+
+    code, kbd, samp, pre, .mono, figcaption, .caption, .meta-value, .meta-label {
+      font-family: var(--font-mono);
+    }
+
+    .highlighter {
+      display: inline;
+      white-space: nowrap;
+      color: var(--ink);
+      padding: 0 0.2em;
+      background-image: linear-gradient(
+        to top,
+        var(--brand-soft) 0%,
+        var(--brand-soft) 60%,
+        transparent 60%,
+        transparent 100%
+      );
+      box-decoration-break: clone;
+      -webkit-box-decoration-break: clone;
+    }
+
+    .brand-badge {
+      display: inline-flex; align-items: center; gap: var(--s-2);
+      padding: var(--s-1) var(--s-3);
+      background: var(--brand-soft); color: var(--brand);
+      border-radius: var(--r-pill);
+      font-family: var(--font-mono);
+      font-weight: var(--fw-medium); font-size: var(--fs-sm);
+    }
+
+    .footer-dark { background: var(--footer-bg); color: var(--footer-text); }
+    .footer-dark a { color: var(--brand-on-dark); }
+
+    /* --- Template-local: reset + layout primitives --------------------- */
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      font-family: var(--font-body);
+      font-size: var(--fs-md);
+      line-height: 1.55;
+      color: var(--ink);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    h1, h2, h3, h4 { font-family: var(--font-display); letter-spacing: 0; line-height: 1.15; margin: 0 0 var(--s-3) 0; }
+    h1 { font-size: var(--fs-3xl); font-weight: 700; }
+    h2 { font-size: var(--fs-2xl); font-weight: 700; }
+    h3 { font-size: var(--fs-xl); font-weight: 700; }
+    h4 { font-size: var(--fs-lg); font-weight: 700; }
+    p  { margin: 0 0 var(--s-3) 0; }
+    a  { color: var(--brand); text-decoration: none; }
+    a:hover { color: var(--brand-hover); text-decoration: underline; }
+
+    .wrap { max-width: min(94vw, 1200px); margin: 0 auto; padding: 0 var(--s-5); }
+    .prose { max-width: 78ch; }
+
+    /* --- Header ------------------------------------------------------- */
+    .memo-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: var(--s-5);
+      flex-wrap: wrap;
+      padding: var(--s-5) 0 var(--s-4);
+      border-bottom: 2px solid var(--ink);
+    }
+    .brand-lockup { display: flex; align-items: center; gap: var(--s-3); }
+    .brand-lockup svg { width: 30px; height: 30px; display: block; }
+    .brand-name {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: 0.01em;
+      color: var(--ink);
+    }
+    .meta-box {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      padding: var(--s-2) var(--s-4);
+      display: flex;
+      align-items: center;
+      gap: var(--s-4);
+      box-shadow: var(--sh-xs);
+      flex-wrap: wrap;
+    }
+    .meta-item { display: flex; flex-direction: column; }
+    .meta-label {
+      color: var(--muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      font-size: 0.62rem;
+      letter-spacing: 0.09em;
+    }
+    .meta-value { color: var(--ink); font-weight: 500; font-size: 0.8rem; }
+    .meta-divider { width: 1px; height: 22px; background: var(--border-strong); }
+
+    /* --- Hero --------------------------------------------------------- */
+    .hero { padding: var(--s-8) 0 var(--s-7); background: var(--bg-2); border-bottom: 1px solid var(--border); }
+    .hero__eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-size: var(--fs-xs);
+      font-weight: 600;
+      color: var(--brand);
+      font-family: var(--font-mono);
+      margin-bottom: var(--s-3);
+    }
+    .hero__title { font-size: clamp(2rem, 4.4vw, 3.1rem); max-width: 20ch; margin-bottom: var(--s-4); }
+    .hero__lead { font-size: var(--fs-lg); color: var(--ink-2); max-width: 62ch; margin: 0; }
+    .hero__lead code { font-size: 0.85em; background: var(--brand-soft); color: var(--brand); padding: 0 4px; border-radius: 3px; }
+
+    /* --- Sections ----------------------------------------------------- */
+    .section { padding: var(--s-7) 0; border-top: 1px solid var(--border); }
+    .section:first-of-type { border-top: 0; }
+    .section-head { display: flex; align-items: baseline; gap: var(--s-4); margin-bottom: var(--s-4); }
+    .section-num {
+      font-family: var(--font-mono);
+      font-size: var(--fs-sm);
+      color: var(--brand);
+      font-weight: 500;
+    }
+    .section-head h2 { margin: 0; font-size: var(--fs-xl); }
+    .lead-claim { font-size: var(--fs-md); font-weight: 600; max-width: 72ch; margin-bottom: var(--s-4); }
+    .section p, .section ul, .section ol { max-width: 78ch; }
+
+    .rule-list { list-style: none; padding: 0; margin: 0 0 var(--s-5) 0; max-width: 78ch; }
+    .rule-list li {
+      padding: var(--s-3) 0;
+      border-top: 1px solid var(--border);
+      display: grid;
+      grid-template-columns: 2.6rem 1fr;
+      gap: var(--s-3);
+      align-items: start;
+    }
+    .rule-list li:last-child { border-bottom: 1px solid var(--border); }
+    .rule-list .k {
+      font-family: var(--font-mono);
+      font-size: var(--fs-sm);
+      color: var(--brand);
+      font-weight: 500;
+      padding-top: 2px;
+    }
+    .rule-list .v strong { display: block; margin-bottom: 2px; }
+
+    .seq-block {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--brand-fill);
+      border-radius: var(--r-md);
+      padding: var(--s-4) var(--s-5);
+      max-width: 78ch;
+    }
+    .seq-block h3 { font-size: var(--fs-md); margin-bottom: var(--s-3); }
+    .seq {
+      font-family: var(--font-mono);
+      font-size: var(--fs-sm);
+      display: grid;
+      grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+      gap: var(--s-2) var(--s-4);
+      margin: 0;
+    }
+    .seq dt { color: var(--ink); font-weight: 500; }
+    .seq dd { margin: 0; color: var(--muted); }
+    .seq dd .hit { color: var(--accent); font-weight: 500; }
+    .seq dd .miss { color: var(--brand); font-weight: 500; }
+
+    /* --- Figure / diagram --------------------------------------------- */
+    figure { margin: 0; }
+    .chart-frame {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      box-shadow: var(--sh-sm);
+      padding: var(--s-4) var(--s-4) var(--s-3);
+    }
+    .chart-frame svg { display: block; width: 100%; height: auto; }
+    figcaption { font-size: var(--fs-sm); color: var(--muted); margin-top: var(--s-3); max-width: 90ch; line-height: 1.5; }
+
+    /* --- Table -------------------------------------------------------- */
+    .data-table-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      overflow: hidden;
+      box-shadow: var(--sh-sm);
+      max-width: 100%;
+    }
+    .data-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+    .data-table thead th {
+      text-align: left;
+      font-weight: 600;
+      color: var(--muted);
+      font-size: var(--fs-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: var(--s-3) var(--s-4);
+      background: var(--bg-2);
+      border-bottom: 1px solid var(--border);
+    }
+    .data-table tbody td {
+      padding: var(--s-3) var(--s-4);
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .data-table tbody tr:last-child td { border-bottom: 0; }
+    .data-table .num { text-align: right; font-variant-numeric: tabular-nums; font-weight: 500; font-family: var(--font-mono); white-space: nowrap; }
+    .data-table .cell-title { font-weight: 600; color: var(--ink); }
+    .data-table tfoot td {
+      padding: var(--s-3) var(--s-4);
+      border-top: 2px solid var(--border-strong);
+      font-weight: 600;
+      background: var(--bg-subtle);
+    }
+    .data-table tfoot td.num { font-family: var(--font-mono); }
+
+    /* --- Cost split bar ----------------------------------------------- */
+    .cost-block { margin-top: var(--s-5); max-width: 78ch; }
+    .cost-block h3 { font-size: var(--fs-md); margin-bottom: var(--s-3); }
+    .cost-bar {
+      display: flex;
+      height: 26px;
+      width: 100%;
+      border-radius: var(--r-sm);
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .cost-bar span { display: block; height: 100%; }
+    .cost-bar__read { width: 44.6%; background: var(--accent-fill); }
+    .cost-bar__out  { width: 44.2%; background: var(--brand-fill); }
+    .cost-bar__miss { width: 11.2%; background: var(--ink-2); }
+    .cost-legend {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 2px;
+      margin: var(--s-3) 0 0;
+      padding: 0;
+      list-style: none;
+      font-size: var(--fs-sm);
+    }
+    .cost-legend li { display: flex; align-items: baseline; gap: var(--s-2); color: var(--ink); padding: 2px 0; }
+    .cost-legend .sw { width: 11px; height: 11px; border-radius: 2px; flex: none; position: relative; top: 1px; }
+    .cost-legend .amount { font-family: var(--font-mono); color: var(--muted); margin-left: var(--s-3); }
+
+    /* --- Breakers ----------------------------------------------------- */
+    .breaker-list { list-style: none; padding: 0; margin: 0 0 var(--s-5) 0; max-width: 78ch; }
+    .breaker-list li {
+      border-top: 1px solid var(--border);
+      padding: var(--s-3) 0;
+    }
+    .breaker-list li:last-child { border-bottom: 1px solid var(--border); }
+    .breaker-list strong { color: var(--ink); }
+    .breaker-list span { color: var(--muted); }
+
+    .plain-list { list-style: none; padding: 0; margin: 0; max-width: 78ch; }
+    .plain-list li { padding: 2px 0 2px var(--s-5); position: relative; }
+    .plain-list li::before {
+      content: "";
+      position: absolute;
+      left: 2px;
+      top: 0.72em;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent-fill);
+    }
+
+    .price-note {
+      border-left: 3px solid var(--border-strong);
+      padding-left: var(--s-4);
+      margin: var(--s-5) 0 0;
+      max-width: 78ch;
+      color: var(--ink-2);
+    }
+
+    h3.subhead { font-size: var(--fs-md); margin: var(--s-6) 0 var(--s-3); letter-spacing: 0; }
+
+    /* --- Footer ------------------------------------------------------- */
+    .footer-dark {
+      background: var(--footer-bg, var(--ink-pure, #000000));
+      color: var(--footer-text, #FFFFFF);
+      padding: 2.5rem 2rem;
+      margin-top: 1rem;
+    }
+    .footer-inner {
+      max-width: min(94vw, 1200px);
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+    }
+    .footer-brand { display: flex; align-items: center; gap: var(--s-3); }
+    .footer-brand svg { width: 28px; height: 28px; display: block; }
+    .footer-name { font-family: var(--font-display); font-weight: 700; font-size: 1rem; color: var(--footer-text); }
+    .footer-tagline { color: var(--footer-muted, #A0A0A0); font-size: 0.85rem; margin-top: 4px; }
+    .footer-sources { max-width: 44ch; font-size: 0.82rem; color: var(--footer-muted, #A0A0A0); line-height: 1.5; }
+    .footer-sources strong { color: var(--footer-text); font-weight: 600; }
+    .footer-sources a { color: var(--brand-on-dark, var(--footer-text)); }
+    .footer-sources a:hover { text-decoration: underline; }
+
+    /* --- Mobile ------------------------------------------------------- */
+    @media (max-width: 720px) {
+      h1 { font-size: var(--fs-2xl); }
+      .memo-header { flex-direction: column; align-items: flex-start; }
+      .meta-box { width: 100%; }
+      .meta-divider { display: none; }
+      .seq { grid-template-columns: 1fr; gap: 2px; }
+      .seq dd { margin-bottom: var(--s-2); }
+      .data-table thead { display: none; }
+      .data-table, .data-table tbody, .data-table tr, .data-table td, .data-table tfoot { display: block; width: 100%; }
+      .data-table tr { padding: var(--s-3) var(--s-4); border-bottom: 1px solid var(--border); }
+      .data-table td { padding: 3px 0; border-bottom: 0; display: flex; justify-content: space-between; gap: var(--s-4); }
+      .data-table td::before {
+        content: attr(data-label);
+        font-weight: 600;
+        color: var(--muted);
+        font-size: var(--fs-xs);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .data-table td.num { text-align: right; }
+      .footer-inner { flex-direction: column; }
+    }
+
+    /* --- Print -------------------------------------------------------- */
+    @media print {
+      @page { size: A4; margin: 16mm; }
+      :root { color-scheme: light; }
+      html[data-theme] {
+        --bg: #f4f2ec;
+        --card: #fbfaf6;
+        --ink: #17162e;
+        --ink-2: #2c2b4a;
+        --muted: #5a5972;
+        --border: #d8d4c8;
+      }
+      body { background: #FFFFFF; color: var(--print-ink, var(--ink)); font-size: 10.5pt; }
+      .no-print { display: none !important; }
+      .hero { background: transparent; padding: var(--s-5) 0; }
+      .section { page-break-inside: avoid; padding: var(--s-5) 0; }
+      .chart-frame, .data-table-wrap, .seq-block, figure { page-break-inside: avoid; box-shadow: none; }
+      .footer-dark { background: #17162e !important; color: #f4f2ec !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      a { color: inherit; text-decoration: none; }
+      a[href]::after { content: " (" attr(href) ")"; font-size: 9pt; color: #666; }
+      .footer-sources a[href]::after { color: #b3b1cc; }
+    }
+  </style>
+</head>
+<body>
+
+<header class="memo-header wrap">
+  <div class="brand-lockup">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="HV monogram">
+      <rect x="1" y="1" width="62" height="62" rx="9" fill="#17162e" stroke="#6f6c9c" stroke-width="2"/>
+      <text x="32" y="40" text-anchor="middle" font-family="'Space Mono', ui-monospace, Consolas, monospace" font-size="28" font-weight="700" fill="#f4f2ec">HV</text>
+      <rect x="14" y="47" width="22" height="3" rx="1.5" fill="#d9577a"/>
+      <rect x="38" y="47" width="12" height="3" rx="1.5" fill="#2fa4a0"/>
+    </svg>
+    <span class="brand-name">Héctor Vera</span>
+  </div>
+  <div class="meta-box">
+    <div class="meta-item">
+      <span class="meta-label">Author</span>
+      <span class="meta-value">Héctor Vera</span>
+    </div>
+    <div class="meta-divider"></div>
+    <div class="meta-item">
+      <span class="meta-label">Coautor</span>
+      <span class="meta-value">DeepSeek V4.1 Flash 1017</span>
+    </div>
+    <div class="meta-divider"></div>
+    <div class="meta-item">
+      <span class="meta-label">Subject</span>
+      <span class="meta-value">Context cache</span>
+    </div>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <div class="hero__eyebrow">Technical note · DeepSeek API</div>
+    <h1 class="hero__title">How DeepSeek's context cache works</h1>
+    <p class="hero__lead">Prefix caching on disk, on by default: no code, no <code>cache_control</code>, no TTL. A cache-hit input token costs 50 times less than a miss, and in the session measured below 99.50% of input tokens hit.</p>
+  </div>
+</section>
+
+<main class="wrap">
+
+  <section class="section" id="matching-rule">
+    <div class="section-head">
+      <span class="section-num">01</span>
+      <h2>The matching rule</h2>
+    </div>
+    <p class="lead-claim">A request hits only when everything it sends begins with a prefix that already exists on disk as a persisted cache unit.</p>
+    <p class="prose">Matching is on the token prefix, not on the conversation and not on a request identifier. A cache unit is written in three situations:</p>
+
+    <ol class="rule-list">
+      <li>
+        <span class="k">a</span>
+        <div class="v">
+          <strong>At every request boundary</strong>
+          <span class="muted">One unit is persisted where the user input stops, another where the model output stops. Send the same opening text again and both units are found.</span>
+        </div>
+      </li>
+      <li>
+        <span class="k">b</span>
+        <div class="v">
+          <strong>On a prefix shared across requests</strong>
+          <span class="muted">When several requests open with the same tokens, DeepSeek persists that common prefix as its own unit. This is what keeps a system prompt and a tool catalogue warm from one session to the next.</span>
+        </div>
+      </li>
+      <li>
+        <span class="k">c</span>
+        <div class="v">
+          <strong>At fixed token intervals inside long text</strong>
+          <span class="muted">Long inputs and long outputs get units written as they grow, so a prefix is never left permanently uncacheable just because no request ended there.</span>
+        </div>
+      </li>
+    </ol>
+
+    <div class="seq-block">
+      <h3>What the rule does in practice</h3>
+      <dl class="seq">
+        <dt>A+B then A+B+C</dt>
+        <dd><span class="hit">hits</span> on A+B. Only C is billed as new input.</dd>
+        <dt>A+B then A+C</dt>
+        <dd><span class="miss">misses</span> from the first token that differs. The request still teaches the cache that A is shared.</dd>
+        <dt>A+D afterwards</dt>
+        <dd><span class="hit">hits</span> on A, because the previous miss registered A as a common prefix.</dd>
+      </dl>
+    </div>
+
+    <p class="prose" style="margin-top: var(--s-4);">The miss does not throw work away: A+C is persisted at its own end, so a later A+C+E hits A+C. What never happens is a partial match inside a request. Either the prefix matches to the end of a persisted unit, or those tokens are new.</p>
+  </section>
+
+  <section class="section" id="growth">
+    <div class="section-head">
+      <span class="section-num">02</span>
+      <h2>What a session looks like</h2>
+    </div>
+    <p class="lead-claim">Each tool-call turn appends a thin slice of new tokens to a prefix that stays cached, so the expensive part of the bar stops growing.</p>
+
+    <figure>
+      <div class="chart-frame">
+        <svg viewBox="0 0 900 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Schematic of prefix growth over four tool-call turns. Each bar is mostly cached prefix, with a thin new-token slice at the top. A fifth bar shows the same context after a full invalidation, where every token is billed as a cache miss.">
+          <g font-family="'IBM Plex Sans', system-ui, sans-serif">
+            <!-- gridlines -->
+            <line x1="78" y1="60" x2="876" y2="60" stroke="var(--chart-grid)"/>
+            <line x1="78" y1="138" x2="876" y2="138" stroke="var(--chart-grid)"/>
+            <line x1="78" y1="216" x2="876" y2="216" stroke="var(--chart-grid)"/>
+            <line x1="78" y1="294" x2="876" y2="294" stroke="var(--chart-grid)"/>
+            <line x1="78" y1="372" x2="876" y2="372" stroke="var(--border-strong)" stroke-width="1.5"/>
+
+            <!-- y ticks -->
+            <g font-size="11" fill="var(--muted)" text-anchor="end" font-family="'IBM Plex Mono', monospace">
+              <text x="68" y="64">40k</text>
+              <text x="68" y="142">30k</text>
+              <text x="68" y="220">20k</text>
+              <text x="68" y="298">10k</text>
+              <text x="68" y="376">0</text>
+            </g>
+
+            <!-- y axis title -->
+            <text x="26" y="216" transform="rotate(-90 26 216)" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="'IBM Plex Mono', monospace">tokens</text>
+
+            <!-- turn 1: prefix 12k, new 6k -->
+            <rect x="119.8" y="231.6" width="76" height="46.8" fill="var(--brand-fill)"/>
+            <rect x="119.8" y="278.4" width="76" height="93.6" fill="var(--accent-fill)"/>
+            <text x="157.8" y="222" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink)">18k</text>
+
+            <!-- turn 2: prefix 18k, new 5k -->
+            <rect x="279.4" y="192.6" width="76" height="39" fill="var(--brand-fill)"/>
+            <rect x="279.4" y="231.6" width="76" height="140.4" fill="var(--accent-fill)"/>
+            <text x="317.4" y="183" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink)">23k</text>
+
+            <!-- turn 3: prefix 23k, new 4k -->
+            <rect x="439" y="161.4" width="76" height="31.2" fill="var(--brand-fill)"/>
+            <rect x="439" y="192.6" width="76" height="179.4" fill="var(--accent-fill)"/>
+            <text x="477" y="152" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink)">27k</text>
+
+            <!-- turn 4: prefix 27k, new 3k -->
+            <rect x="598.6" y="138" width="76" height="23.4" fill="var(--brand-fill)"/>
+            <rect x="598.6" y="161.4" width="76" height="210.6" fill="var(--accent-fill)"/>
+            <text x="636.6" y="128.5" text-anchor="middle" font-size="12" font-weight="600" fill="var(--ink)">30k</text>
+
+            <!-- invalidation: same 30k, all miss -->
+            <rect x="758.2" y="138" width="76" height="234" fill="var(--brand-fill)"/>
+            <text x="796.2" y="112" text-anchor="middle" font-size="11.5" font-weight="600" fill="var(--brand)">30k tokens</text>
+            <text x="796.2" y="126" text-anchor="middle" font-size="11.5" fill="var(--muted)" font-family="'IBM Plex Mono', monospace">$0.009 peak</text>
+
+            <!-- x labels -->
+            <g font-size="12" fill="var(--ink)" text-anchor="middle" font-family="'IBM Plex Mono', monospace">
+              <text x="157.8" y="392">turn 1</text>
+              <text x="317.4" y="392">turn 2</text>
+              <text x="477" y="392">turn 3</text>
+              <text x="636.6" y="392">turn 4</text>
+              <text x="796.2" y="392" fill="var(--brand)">invalidation</text>
+            </g>
+            <text x="796.2" y="408" text-anchor="middle" font-size="11" fill="var(--muted)">every token billed as miss</text>
+
+            <!-- x axis title -->
+            <text x="477" y="432" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="'IBM Plex Mono', monospace">tool-call turn</text>
+
+            <!-- legend -->
+            <rect x="78" y="448" width="11" height="11" rx="2" fill="var(--accent-fill)"/>
+            <text x="96" y="458" font-size="11.5" fill="var(--ink)">prefix read from cache (hit price)</text>
+            <rect x="380" y="448" width="11" height="11" rx="2" fill="var(--brand-fill)"/>
+            <text x="398" y="458" font-size="11.5" fill="var(--ink)">new tokens this turn (miss price)</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>Bar heights are schematic: the point is the composition, not the exact counts. The cached prefix carries over untouched from one turn to the next and only the tail is billed as new input. The last bar re-sends the same 30k-token context after an invalidation, when nothing matches and every token is billed at the miss rate, $0.009 at peak.</figcaption>
+    </figure>
+  </section>
+
+  <section class="section" id="measured">
+    <div class="section-head">
+      <span class="section-num">03</span>
+      <h2>Measured on a real session</h2>
+    </div>
+    <p class="lead-claim">One root OpenCode session on deepseek-flash spent $0.2398 to move 36.0M tokens, and 99.50% of the input tokens were cache hits.</p>
+    <p class="prose">Figures come from the session's own usage record and from the provider-reported cost. Prices are the off-peak rates: $0.003 per 1M cache-hit input, $0.15 per 1M miss input, $0.60 per 1M output, with reasoning billed as output.</p>
+
+    <div class="data-table-wrap">
+      <table class="data-table">
+        <caption style="caption-side: bottom; text-align: left; padding: var(--s-3) var(--s-4); font-size: var(--fs-sm); color: var(--muted);">Output tokens: 92,521 generated plus 84,189 reasoning, both billed at the output rate.</caption>
+        <thead>
+          <tr>
+            <th>Line</th>
+            <th class="num">Tokens</th>
+            <th class="num">Rate per 1M</th>
+            <th class="num">Cost</th>
+            <th class="num">Share</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td data-label="Line"><span class="cell-title">Input, cache hit</span></td>
+            <td data-label="Tokens" class="num">35,662,336</td>
+            <td data-label="Rate per 1M" class="num">$0.003</td>
+            <td data-label="Cost" class="num">$0.1070</td>
+            <td data-label="Share" class="num">44.6%</td>
+          </tr>
+          <tr>
+            <td data-label="Line"><span class="cell-title">Input, cache miss</span></td>
+            <td data-label="Tokens" class="num">178,537</td>
+            <td data-label="Rate per 1M" class="num">$0.15</td>
+            <td data-label="Cost" class="num">$0.0268</td>
+            <td data-label="Share" class="num">11.2%</td>
+          </tr>
+          <tr>
+            <td data-label="Line"><span class="cell-title">Output, reasoning included</span></td>
+            <td data-label="Tokens" class="num">176,710</td>
+            <td data-label="Rate per 1M" class="num">$0.60</td>
+            <td data-label="Cost" class="num">$0.1060</td>
+            <td data-label="Share" class="num">44.2%</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td data-label="Line">Total</td>
+            <td data-label="Tokens" class="num">36,017,583</td>
+            <td data-label="Rate per 1M" class="num"></td>
+            <td data-label="Cost" class="num">$0.2398</td>
+            <td data-label="Share" class="num">100%</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <div class="cost-block">
+      <h3>Where each cent went</h3>
+      <div class="cost-bar" role="img" aria-label="Cost split: cache-hit input 44.6 percent, output and reasoning 44.2 percent, cache-miss input 11.2 percent.">
+        <span class="cost-bar__read"></span>
+        <span class="cost-bar__out"></span>
+        <span class="cost-bar__miss"></span>
+      </div>
+      <ul class="cost-legend">
+        <li><span class="sw" style="background: var(--accent-fill);"></span> Cache-hit input <span class="amount">$0.1070 · 44.6%</span></li>
+        <li><span class="sw" style="background: var(--brand-fill);"></span> Output plus reasoning <span class="amount">$0.1060 · 44.2%</span></li>
+        <li><span class="sw" style="background: var(--ink-2);"></span> Cache-miss input <span class="amount">$0.0268 · 11.2%</span></li>
+      </ul>
+    </div>
+
+    <p class="prose" style="margin-top: var(--s-5);">The three lines add up to the $0.2398 the provider reported, to the cent. That is how the price model was confirmed: no separate charge appears for writing the cache, reasoning bills at the output rate, and everything read back gets the same discount.</p>
+    <p class="prose">The cache was already warm at the first request. Session start read 12,544 tokens from cache against 5,288 new ones, because a previous session had persisted the same system prompt. Only a first session with nothing on disk pays the miss price on its prompt.</p>
+  </section>
+
+  <section class="section" id="invalidation">
+    <div class="section-head">
+      <span class="section-num">04</span>
+      <h2>What breaks the cache</h2>
+    </div>
+    <p class="lead-claim">Changing anything at the front of the request invalidates every unit written after the first token that differs.</p>
+    <p class="prose">In an agent session the front of the request is assembled, not typed. That is where a cache gets lost:</p>
+
+    <ul class="breaker-list">
+      <li><strong>Editing an instruction file the agent loads.</strong> <span>An instruction file, a rules file or a skill body sits near the start, so every token after it counts as new.</span></li>
+      <li><strong>Adding or removing a skill.</strong> <span>The skill catalogue lives in the system prompt, so the prompt changes even when the skill is never used.</span></li>
+      <li><strong>Restarting an MCP server.</strong> <span>The tool list is part of the prompt, and a restart can change it.</span></li>
+      <li><strong>Switching agent or model mid-session.</strong> <span>A different system prompt is a different prefix, so the cached units no longer line up.</span></li>
+      <li><strong>Running <code>/reload</code>.</strong> <span>Config and prompt are rebuilt from disk.</span></li>
+      <li><strong>Context compaction.</strong> <span>History is replaced by a summary, and the summary is not the text that was cached.</span></li>
+    </ul>
+
+    <p class="price-note">A full invalidation on a 40k-token context costs $0.012 at peak, at $0.30 per 1M miss tokens, or $0.006 off-peak. The same 40k read from cache costs $0.00024 at peak. A handful of invalidations in a session is noise; a reload inside a loop is not.</p>
+
+    <h3 class="subhead">What does not break it</h3>
+    <ul class="plain-list">
+      <li><strong>Appending tool output.</strong> New tokens extend the end of the prefix; the cached part stays where it was.</li>
+      <li><strong>A new user turn.</strong> Same reason: the conversation grows to the right.</li>
+      <li><strong>A subagent opening a fresh session.</strong> It starts its own prefix and leaves the parent's cache untouched.</li>
+    </ul>
+  </section>
+
+  <section class="section" id="cost">
+    <div class="section-head">
+      <span class="section-num">05</span>
+      <h2>Where the money actually goes</h2>
+    </div>
+    <p class="prose">In the measured session, cached input and output cost almost the same amount, $0.1070 against $0.1060, but they behave differently. Cached input grows with how long the session runs and is paid at the cheapest rate on the price list; output grows with what the model writes and what it reasons through, and you decide both. Peak pricing beats every caching trick: two UTC windows on weekdays (01:00-04:00 and 06:00-10:00) double every line, and the same session at peak would have cost $0.4796. Running a long job off-peak is worth more than any cache optimisation inside it.</p>
+  </section>
+
+</main>
+
+<footer class="footer-dark">
+  <div class="footer-inner">
+    <div>
+      <div class="footer-brand">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="HV monogram">
+          <rect x="1" y="1" width="62" height="62" rx="9" fill="#17162e" stroke="#6f6c9c" stroke-width="2"/>
+          <text x="32" y="40" text-anchor="middle" font-family="'Space Mono', ui-monospace, Consolas, monospace" font-size="28" font-weight="700" fill="#f4f2ec">HV</text>
+          <rect x="14" y="47" width="22" height="3" rx="1.5" fill="#d9577a"/>
+          <rect x="38" y="47" width="12" height="3" rx="1.5" fill="#2fa4a0"/>
+        </svg>
+        <span class="footer-name">Héctor Vera</span>
+      </div>
+      <div class="footer-tagline">Technical note · DeepSeek API</div>
+    </div>
+    <div class="footer-sources">
+      <strong>Sources.</strong>
+      <a href="https://api-docs.deepseek.com/guides/kv_cache/">DeepSeek KV cache guide</a> for the matching and persistence rules;
+      <a href="https://api-docs.deepseek.com/quick_start/pricing/">DeepSeek pricing</a> for the rates and peak windows.
+      Local pricing note and peak-hour config: <span class="mono">3 Resources/DeepSeek API Pricing and Peak Hours.md</span>.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

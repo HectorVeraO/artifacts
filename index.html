@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Artifacts</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0 auto;
+      max-width: 44rem;
+      padding: 3rem 1.5rem;
+      font: 400 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      color: #17162e;
+      background: #f4f2ec;
+    }
+    h1 { font-size: 1.5rem; margin: 0 0 1.5rem; }
+    ul { padding-left: 1.1rem; }
+    li { margin: 0.4rem 0; }
+    a { color: #ae3358; }
+    p.note { color: #5a5972; font-size: 0.9rem; margin-top: 2rem; }
+    @media (prefers-color-scheme: dark) {
+      body { color: #f4f2ec; background: #17162e; }
+      a { color: #f08aa6; }
+      p.note { color: #a9a7c2; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Artifacts</h1>
+  <ul>
+    <li><a href="deepseek-kv-cache/">How DeepSeek's context cache works</a>: one-pager on prefix caching, measured on a real session.</li>
+  </ul>
+  <p class="note">Static pages published from Héctor Vera's notes.</p>
+</body>
+</html>
